@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT license.
+
+import re
+import numpy as np
+import click
+import json
+import logging
+from collections import Counter
+from frames.utils import key_value_pairs, ActJSON2Str
+
+
+logging.getLogger().setLevel(logging.INFO)
+
+
+def vis(jsondata):
+    """simplify json output containing NeoBunch and lists of floats.
+
+    this helps if you use the `prnt --brk` command to stop and inspect the
+    turn.
+    """
+    if isinstance(jsondata, list):
+        if len(jsondata) > 0 and all(isinstance(i, float) for i in jsondata):
+            return np.asarray(jsondata)
+        else:
+            return [vis(v) for v in jsondata]
+    if isinstance(jsondata, dict):
+        ret = dict()
+        for k, v in jsondata.items():
+            ret[k] = vis(v)
+        return ret
+    return jsondata
+
+
+def make_act_hist(tups):
+    cnt = Counter()
+    for tup in tups:
+        for a in tup[3]['labels']['acts']:
+            cnt[a['name']] += 1
+    return cnt
+
+
+def _has_act(turn, acts, only=False, allowed_slot_args=None):
+    if isinstance(acts, str):
+        acts = acts.split()
+    found = False
+    found_others = False
+    for a in turn['labels']['acts']:
+        if a['name'] in acts:
+            if allowed_slot_args is not None:
+                non_refs_args = [g['key'] for g in a['args'] if g['key'] not in 'read write ref'.split()]
+                tmp = False
+                if len(set(non_refs_args) - set(allowed_slot_args)) > 0:
+                    tmp = True
+                else:
+                    ref_args = [g['val'] for g in a['args'] if g['key'] in 'read write ref'.split()]
+                    for ref in ref_args:
+                        for refval in ref:
+                            if len(set([g['key'] for g in refval['annotations']]) - set(allowed_slot_args)) > 0:
+                                tmp = True
+                if tmp:
+                    found_others = True
+                else:
+                    found = True
+            else:
+                found = True
+        else:
+            found_others = True
+    return found if only is False else (found and not found_others)
+
+
+@click.group(chain=True, invoke_without_command=True)
+@click.argument("jsondata", type=click.File('r'))
+@click.option("--count", "-c", is_flag=True)
+@click.option("--iter-slots", '-s', is_flag=True, help='iterate over + filter annotated slots *inside* turns as well')
+@click.option("--act-hist", is_flag=True)
+@click.option("--saveas", '-o', help='save a modified file to this location')
+@click.pass_context
+def cli(ctx, jsondata, count, act_hist, iter_slots, saveas):
+    """
+    show subset of turns of Frames data matchig given criteria.
+    """
+    pass
+
+
+@cli.resultcallback()
+@click.pass_context
+def process_pipeline(ctx, processors, jsondata, count, act_hist, iter_slots, saveas):
+    """
+    foo bar baz.
+    """
+    np.set_printoptions(2, suppress=True, edgeitems=6)
+    dlgs = json.load(jsondata)
+    try:
+        import neobunch
+        dlgs = neobunch.neobunchify(dlgs)
+    except:
+        pass
+    jsondata.close()
+    ctx.obj['dlgs'] = dlgs
+    logging.info("Read %d dialogues", len(dlgs))
+
+    def turn_iterator():
+        for didx, dlg in enumerate(dlgs):
+            for tidx, turn in enumerate(dlg['turns']):
+                if not iter_slots:
+                    yield (didx, tidx, dlg, turn)
+                    continue
+                for act in turn['labels']['acts_without_refs']:
+                    for arg in act['args']:
+                        yield (didx, tidx, dlg, turn, act, arg)
+
+    iterator = iter(turn_iterator())
+    for processor in processors:
+        iterator = processor(iterator)
+
+    L = []
+    cnt = None
+    for cnt, item in enumerate(iterator):
+        L.append(item)
+
+    if act_hist:
+        print(make_act_hist(L))
+
+    if cnt is not None:
+        cnt += 1
+    else:
+        cnt = 0
+
+    logging.info("Found %d matching entries", cnt)
+    if saveas is not None:
+        logging.info("Saving to %s", saveas)
+        with open(saveas, 'w', encoding='utf-8') as f:
+            json.dump(dlgs, f)
+
+
+@cli.command("curr-frame-not-last")
+@click.pass_context
+def make_curr_frame_not_last(ctx):
+    """
+    true if the current frame is not the one with the highest index
+    """
+    def foo(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            prev_turn = dict(labels=dict(frames=[dict()], active_frame=1))
+            if tidx >= 0:
+                prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            n_frames = len(prev_turn['labels']['frames'])
+            if tup[3]['labels']['active_frame'] not in (n_frames, n_frames - 1):
+                yield tup
+
+    return foo
+
+
+@cli.command("prnt")
+@click.option("--fmt", '-f', default='{text}\n\t{acts}')
+@click.option("--brk", '-b', is_flag=True, help='set breakpoint for every match')
+@click.option("--brk-match", '-m', help='regex to match text as condition for breakpoint')
+@click.pass_context
+def make_prnt(ctx, fmt, brk, brk_match):
+    """
+    prints the act in the format specified. Optionally starts debugger for
+    match.
+    """
+    a2s = ActJSON2Str(arg_sep='\n\t\t\t')
+    fmt = fmt.replace("\\n", "\n")
+    fmt = fmt.replace("\\t", "\t")
+
+    def foo(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            prev_turn = dict(labels=dict(frames=[], active_frame=1))
+            if tidx >= 0:
+                prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+
+            vals = dict(text=tup[3]['text'],
+                        acts=',\n\t\t'.join(a2s.transform(tup[3]['labels']['acts'])),
+                        n_frames=len(prev_turn['labels']['frames']),
+                        prev_frame=prev_turn['labels']['active_frame'],
+                        )
+            if 'predictions' in tup[3]:
+                vals['pred_acts'] = ",\n\t\t".join(a2s.transform(tup[3]['predictions']['acts']))
+            try:
+                if len(tup) > 4:
+                    vals['act'] = tup[4]['name']
+                    vals['key'] = tup[5]['key']
+                    vals['val'] = tup[5].get('val')
+
+            except:
+                pass
+            print(fmt.format(**vals))
+            if brk and (brk_match is None or re.search(brk_match, vals['text'])):
+                turn = tup[3]
+                turn
+                prev_turn
+                import ipdb
+                ipdb.set_trace()
+            yield tup
+
+    return foo
+
+
+@cli.command("regex")
+@click.argument("flt")
+def make_regex(flt):
+    """
+    true if the text matches the given regex (case is ignored)
+    """
+    def foo(iterator):
+        for tup in iterator:
+            if re.search(flt, tup[3]['text'], re.I):
+                yield tup
+    return foo
+
+
+@cli.command("tag")
+@click.option("--clear-first", '-c', is_flag=True, help='clears tags before adding this one')
+@click.argument("tags")
+def make_tag(tags, clear_first):
+    """
+    adds the specified tag to the turn.
+
+    Use --saveas to save the tagged file.
+    """
+    tags = tags.split()
+    for t in tags:
+        assert re.match(r'^\w+(\.\w+)*$', t)
+
+    def foo(iterator):
+        for tup in iterator:
+            if clear_first:
+                tup[3]['labels']['tags'] = []
+            tup[3]['labels'].setdefault('tags', []).extend(tags)
+            tup[3]['labels']['tags'] = list(set(tup[3]['labels']['tags']))
+            yield tup
+    return foo
+
+
+@cli.command("has-slot")
+@click.option("--invert", "-i", is_flag=True)
+@click.option("--act")
+@click.argument("slots")
+def make_has_slot(invert, slots, act):
+    """
+    only show cases where one of the given slots is present.
+    Separate multiple slots by spaces.
+    (requires --slot-iter)
+    """
+
+    slots = slots.split()
+
+    def foo(iterator):
+        for tup in iterator:
+            if act is not None and tup[4]['name'] != act:
+                continue
+
+            if invert != (tup[5]['key'] in slots):
+                yield tup
+
+    return foo
+
+
+@cli.command("author")
+@click.argument("author")
+def make_author(author):
+    """
+    show turns by given author
+    """
+    def foo(iterator):
+        for tup in iterator:
+            if tup[3]['author'] == author:
+                yield tup
+    return foo
+
+
+@cli.command("has-act")
+@click.option("--only", is_flag=True, help='show turns that *only* have this act')
+@click.option("--invert", "-i", is_flag=True, help='show turns that do *not* have this act')
+@click.option("--allowed-slot-args", help='shows only acts without slot arguments')
+@click.argument("act_name")
+def make_has_act(act_name, only, invert, allowed_slot_args):
+    """
+    show turns that have an act as given.
+    """
+    if isinstance(allowed_slot_args, str):
+        allowed_slot_args = allowed_slot_args.split()
+
+    def has_act(iterator):
+        for tup in iterator:
+            if invert != _has_act(tup[3], act_name, only=only, allowed_slot_args=allowed_slot_args):
+                yield tup
+    return has_act
+
+
+@cli.command("is-act")
+@click.option("--invert", "-i", is_flag=True)
+@click.argument("act_name")
+def make_is_act(act_name, invert):
+    """
+    show turns that have an act as given.
+    """
+    act_name = act_name.split()
+
+    def foo(iterator):
+        for tup in iterator:
+            if invert != (tup[4]['name'] in act_name):
+                yield tup
+
+    return foo
+
+
+@cli.command("prev-has-act")
+@click.argument("act_name")
+@click.pass_context
+def make_prev_has_act(ctx, act_name):
+    """
+    show turns where the previous turn has a given act.
+    """
+    def prev_has_act(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            if tidx < 0:
+                continue
+            prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            if _has_act(prev_turn, act_name):
+                yield tup
+    return prev_has_act
+
+
+@cli.command("prev-has-no-act")
+@click.argument("act_name")
+@click.pass_context
+def make_prev_has_no_act(ctx, act_name):
+    """
+    show turns where the previous turn does not have a given act.
+    """
+    def prev_has_no_act(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            if tidx < 0:
+                continue
+            prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            if _has_act(prev_turn, act_name):
+                continue
+            yield tup
+    return prev_has_no_act
+
+
+@cli.command("no-homogeneous-refs")
+@click.option("--invert", "-i", is_flag=True)
+def make_no_homogeneous_refs(invert):
+    """
+    shows turns which refer to more than one frame.
+    """
+    def foo(iterator):
+        for tup in iterator:
+            allrefs = set()
+            for act in tup[3]['labels']['acts']:
+                for frame, key, val in key_value_pairs(act, with_frames=True, current_frame=tup[3]['labels']['active_frame']):
+                    allrefs.add(frame)
+            ok = (len(allrefs) > 1) != invert
+            if ok:
+                yield tup
+
+    return foo
+
+
+@cli.command("has-tag")
+@click.option("--invert", "-i", is_flag=True)
+@click.argument("tags")
+def make_has_tag(invert, tags):
+    """
+    shows turns which have a given tag
+    """
+    tags = tags.split()
+
+    def foo(iterator):
+        for tup in iterator:
+            found = False
+            for tag in tup[3]['labels'].get('tags', []):
+                if tag in tags:
+                    found = True
+            ok = found != invert
+            if ok:
+                yield tup
+
+    return foo
+
+
+@cli.command("has-noanno")
+@click.option("--invert", "-i", is_flag=True)
+def make_has_noanno(invert):
+    """
+    shows turns which have a NOANNO reference
+    """
+    def foo(iterator):
+        for tup in iterator:
+            found = False
+            for act in tup[3]['labels']['acts']:
+                for frame, key, val in key_value_pairs(act, with_frames=True, current_frame=tup[3]['labels']['active_frame']):
+                    if key == 'NOANNO':
+                        found = True
+            ok = found != invert
+            if ok:
+                yield tup
+
+    return foo
+
+
+@cli.command("only-current-frame-refs")
+@click.option("--invert", "-i", is_flag=True)
+def make_only_current_frame_refs(invert):
+    """
+    true if all references are to the currently active frame.
+    """
+    def foo(iterator):
+        for tup in iterator:
+            allrefs = set()
+            current_frame = tup[3]['labels']['active_frame']
+            for act in tup[3]['labels']['acts']:
+                for frame, key, val in key_value_pairs(act, with_frames=True, current_frame=current_frame):
+                    allrefs.add(frame)
+
+            ok = len(allrefs) == 1 and tuple(allrefs)[0] == current_frame
+            ok = invert != ok
+            if ok:
+                yield tup
+
+    return foo
+
+
+@cli.command("not-about-current-frame")
+def make_not_about_current_frame():
+    """
+    true if no ref refers to current frame
+    """
+    def foo(iterator):
+        for tup in iterator:
+            allrefs = set()
+            current_frame = tup[3]['labels']['active_frame']
+            for act in tup[3]['labels']['acts']:
+                for frame, key, val in key_value_pairs(act, with_frames=True, current_frame=current_frame):
+                    allrefs.add(frame)
+
+            ok = current_frame not in allrefs
+            if ok:
+                yield tup
+
+    return foo
+
+
+@cli.command("active-frame-changed")
+@click.option("--invert", "-i", is_flag=True)
+@click.option("--verbose", "-v", is_flag=True)
+@click.pass_context
+def make_active_frame_changed(ctx, invert, verbose):
+    """
+    show turns where the active frame changed
+    """
+    def foo(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            if tidx < 0:
+                if invert:
+                    yield tup
+                continue
+            prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            ok = invert
+            if prev_turn['labels']['active_frame'] != tup[3]['labels']['active_frame']:
+                if verbose:
+                    tup[3]['text'] += ' (%d->%d)' % (prev_turn['labels']['active_frame'], tup[3]['labels']['active_frame'])
+                ok = not ok
+
+            if ok:
+                yield tup
+    return foo
+
+
+@cli.command("direct-switch-to-offer")
+@click.option("--invert", "-i", is_flag=True)
+@click.pass_context
+def make_direct_switch_to_offer(ctx, invert):
+    """
+    show turns where the new active frame is an id introduced in the previous turn
+    """
+    def foo(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            if tidx < 0:
+                if invert:
+                    yield tup
+                continue
+            prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            current_frame = tup[3]['labels']['active_frame']
+            found = False
+            for act in prev_turn['labels']['acts']:
+                for arg in act['args']:
+                    if arg['key'] == 'id' and current_frame == arg['val']:
+                        found = True
+            if found != invert:
+                yield tup
+    return foo
+
+
+@cli.command("prev-has-multiple-offers")
+@click.option("--invert", "-i", is_flag=True)
+@click.pass_context
+def make_prev_has_multiple_offers(ctx, invert):
+    """
+    show turns where the previous turn had multiple offers
+    """
+    def foo(iterator):
+        for tup in iterator:
+            tidx = tup[1] - 1
+            if tidx < 0:
+                if invert:
+                    yield tup
+                continue
+            prev_turn = ctx.obj['dlgs'][tup[0]]['turns'][tidx]
+            allids = set()
+            for act in prev_turn['labels']['acts']:
+                for arg in act['args']:
+                    if arg['key'] == 'id':
+                        allids.add(arg['val'])
+            if (len(allids) > 1) != invert:
+                yield tup
+    return foo
+
+
+if __name__ == '__main__':
+    cli(obj={})
