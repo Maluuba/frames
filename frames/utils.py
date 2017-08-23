@@ -3,10 +3,12 @@
 
 import logging
 import re
-from itertools import zip_longest
+
 import numpy as np
 import tabulate
 import colorama
+
+from six.moves import zip_longest
 
 
 EPSILON = 1e-6

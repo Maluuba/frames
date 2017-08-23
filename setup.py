@@ -3,6 +3,7 @@
 from setuptools import setup
 reqs = [
     "numpy",
+    "six",
     "click",
     "tabulate",
     "nose",
