@@ -7,7 +7,7 @@ by Hannes Schulz, Jeremie Zumer, Layla El Asri, and Shikhar Sharma.
 
 ## Installation
 
-You should first download the [Maluuba Frames dataset](http://datasets.maluuba.com/Frames/dl) from the Maluuba website.
+You should first download the [Maluuba Frames dataset](https://datasets.maluuba.com/Frames/dl) from the Maluuba website.
 
 Clone the repository with
 ```bash
