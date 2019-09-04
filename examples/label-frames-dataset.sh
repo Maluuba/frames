@@ -9,7 +9,7 @@ FREX=frametracking-tagger
 
 mkdir -p data
 if [ ! -e $I ]; then
-	echo "Please download $I from http://datasets.maluuba.com/Frames/dl"
+	echo "Please download $I from https://www.microsoft.com/en-us/research/project/frames-dataset/#!download"
 	exit 1
 fi
 
